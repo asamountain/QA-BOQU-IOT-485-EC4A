@@ -10,6 +10,24 @@
 #include <modbus.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdlib>
+#include <termios.h>
+
+// ===========================
+// CALIBRATION CONSTANTS
+// ===========================
+const int CALIBRATION_REG_MODE = 13;        // Calibration mode register
+const int CALIBRATION_REG_COEFF = 28;       // Calibration coefficient register (float)
+const float CALIBRATION_COEFF_VALUE = 12880;  // Standard EC calibration value
+const uint16_t CAL_MODE_1_VALUE = 2;        // Mode 1: Write value 2 to register 13
+const uint16_t CAL_MODE_2_VALUE = 3;        // Mode 2: Write value 3 to register 13
+
+enum CalibrationMode {
+    CAL_MODE_NONE = 0,    // Skip calibration
+    CAL_MODE_1 = 1,       // Mode 1: Register 13 = 2
+    CAL_MODE_2 = 2,       // Mode 2: Register 28 = 12.880, Register 13 = 3
+    CAL_MODE_3 = 3        // Mode 3: TEST - Write K=190 to Register 16
+};
 
 // ===========================
 // DYNAMIC COEFFICIENT LOOKUP
@@ -123,6 +141,203 @@ std::string to_hex_string(uint16_t reg_high, uint16_t reg_low) {
 }
 
 // ===========================
+// MODBUS WRITE: SINGLE INTEGER REGISTER
+// ===========================
+bool write_integer_register(modbus_t *ctx, int reg_addr, uint16_t value) {
+    // Show what we're about to write
+    std::cout << "  [WRITE] Sending to Register " << reg_addr
+              << ": Value=" << value
+              << " (0x" << std::hex << std::uppercase << value << std::dec << ")\n";
+
+    // Write the register
+    int rc = modbus_write_register(ctx, reg_addr, value);
+    if (rc == -1) {
+        std::cerr << "  [ERROR] Failed to write register " << reg_addr
+                  << ": " << modbus_strerror(errno) << std::endl;
+        return false;
+    }
+
+    // Read back to verify
+    uint16_t verify_value;
+    if (modbus_read_registers(ctx, reg_addr, 1, &verify_value) != -1) {
+        std::cout << "  [VERIFY] Read back from Register " << reg_addr
+                  << ": Value=" << verify_value
+                  << " (0x" << std::hex << std::uppercase << verify_value << std::dec << ")\n";
+
+        if (verify_value == value) {
+            std::cout << "  [OK] Write verified successfully!\n";
+        } else {
+            std::cerr << "  [WARNING] Read-back value differs! Expected " << value
+                      << ", got " << verify_value << "\n";
+        }
+    } else {
+        std::cerr << "  [WARNING] Could not verify write (read-back failed)\n";
+    }
+
+    return true;
+}
+
+// ===========================
+// MODBUS WRITE: FLOAT VALUE (2 REGISTERS, ABCD FORMAT)
+// ===========================
+// Note: A 32-bit float requires 2 consecutive 16-bit registers.
+// When writing to Register 28, it automatically uses Register 29 too.
+// This is standard Modbus behavior (same as Modbus Poll).
+bool write_float_register(modbus_t *ctx, int reg_addr, float value) {
+    uint16_t reg_data[2];
+
+    // Convert float to ABCD format (Big Endian, matches sensor's format)
+    modbus_set_float_abcd(value, reg_data);
+
+    // Show what we're about to write
+    std::cout << "  [WRITE] Float " << std::fixed << std::setprecision(3) << value
+              << " -> Register " << reg_addr << " (uses " << reg_addr << "-" << (reg_addr + 1) << " internally)\n";
+    std::cout << "          Hex: " << to_hex_string(reg_data[0], reg_data[1])
+              << " (Reg" << reg_addr << "=0x" << std::hex << std::uppercase << reg_data[0]
+              << ", Reg" << (reg_addr + 1) << "=0x" << reg_data[1] << std::dec << ")\n";
+
+    // Write 2 consecutive registers (starting at reg_addr)
+    int rc = modbus_write_registers(ctx, reg_addr, 2, reg_data);
+    if (rc == -1) {
+        std::cerr << "  [ERROR] Failed to write float to register " << reg_addr
+                  << ": " << modbus_strerror(errno) << std::endl;
+        return false;
+    }
+
+    // Read back to verify
+    uint16_t verify_data[2];
+    usleep(100000);  // 100ms delay for sensor to process
+
+    if (modbus_read_registers(ctx, reg_addr, 2, verify_data) != -1) {
+        float read_back = modbus_get_float_abcd(verify_data);
+        std::cout << "  [VERIFY] Reading back from Register " << reg_addr << "...\n";
+        std::cout << "          Read: " << std::fixed << std::setprecision(3) << read_back
+                  << " (Hex: " << to_hex_string(verify_data[0], verify_data[1]) << ")\n";
+
+        if (fabs(read_back - value) < 0.001f) {
+            std::cout << "  [OK] Write verified successfully!\n";
+        } else {
+            std::cerr << "  [WARNING] Read-back value differs! Expected " << value
+                      << ", got " << read_back << "\n";
+        }
+    } else {
+        std::cerr << "  [WARNING] Could not verify write (read-back failed)\n";
+    }
+
+    return true;
+}
+
+// ===========================
+// EXECUTE CALIBRATION SEQUENCE
+// ===========================
+bool execute_calibration(modbus_t *ctx, CalibrationMode mode) {
+    if (mode == CAL_MODE_NONE) {
+        std::cout << "  [INFO] Calibration skipped (mode 0)" << std::endl;
+        return true;
+    }
+
+    std::cout << "\n";
+    std::cout << "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n";
+    std::cout << "┃               CALIBRATION MODE " << static_cast<int>(mode) << " EXECUTION                           ┃\n";
+    std::cout << "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n";
+
+    bool success = true;
+
+    if (mode == CAL_MODE_1) {
+        // Mode 1: Write Register 13 = 2
+        std::cout << "  Mode 1: Writing calibration mode value...\n";
+        success = write_integer_register(ctx, CALIBRATION_REG_MODE, CAL_MODE_1_VALUE);
+
+    } else if (mode == CAL_MODE_2) {
+        // Mode 2: Write Register 28 = 12.880, then Register 13 = 3
+        std::cout << "  Mode 2: Writing calibration coefficient...\n";
+        success = write_float_register(ctx, CALIBRATION_REG_COEFF, CALIBRATION_COEFF_VALUE);
+
+        if (success) {
+            std::cout << "  Mode 2: Writing calibration mode value...\n";
+            success = write_integer_register(ctx, CALIBRATION_REG_MODE, CAL_MODE_2_VALUE);
+        }
+
+    } else if (mode == CAL_MODE_3) {
+        // Mode 3: TEST writing K value to Register 16
+        std::cout << "  Mode 3: TESTING K coefficient write to Register 16...\n";
+        std::cout << "  Writing K=0.0190 scaled to 190 (K x 10000)...\n";
+        uint16_t test_k = 190;  // 0.0190 * 10000
+        success = write_integer_register(ctx, 16, test_k);
+
+        if (success) {
+            std::cout << "\n  SUCCESS! Sensor accepts K x 10000 format.\n";
+            std::cout << "  You can now enable auto-K in the main loop.\n";
+        } else {
+            std::cout << "\n  FAILED! Sensor may not accept this format.\n";
+            std::cout << "  Try K x 1000 (value=19) instead.\n";
+        }
+    }
+
+    if (success) {
+        std::cout << "\n  Calibration Mode " << static_cast<int>(mode) << " completed successfully!\n\n";
+    } else {
+        std::cerr << "\n  Calibration failed! Check sensor connection.\n\n";
+    }
+
+    // Give sensor time to process calibration
+    sleep(1);
+
+    return success;
+}
+
+// ===========================
+// GET CALIBRATION MODE FROM USER/ARGS
+// ===========================
+CalibrationMode get_calibration_mode(int argc, char* argv[]) {
+    // Check for command-line argument
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--mode" && i + 1 < argc) {
+            int mode = std::atoi(argv[i + 1]);
+            if (mode >= 0 && mode <= 3) {
+                std::cout << "  Using calibration mode " << mode << " from command line.\n";
+                return static_cast<CalibrationMode>(mode);
+            } else {
+                std::cerr << "  Invalid mode '" << mode << "'. Using interactive selection.\n";
+            }
+        }
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "\nUsage: ./smart_logger [OPTIONS]\n\n";
+            std::cout << "Options:\n";
+            std::cout << "  --mode 0    Skip calibration\n";
+            std::cout << "  --mode 1    Calibration Mode 1: Register 13 = 2\n";
+            std::cout << "  --mode 2    Calibration Mode 2: Register 28 = 12.880, Register 13 = 3\n";
+            std::cout << "  --mode 3    TEST Mode: Write K=190 to Register 16 (test x10000 format)\n";
+            std::cout << "  --help      Show this help message\n\n";
+            exit(0);
+        }
+    }
+
+    // Interactive mode selection
+    std::cout << "\n";
+    std::cout << "╔═══════════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║              SELECT CALIBRATION MODE                                  ║\n";
+    std::cout << "╠═══════════════════════════════════════════════════════════════════════╣\n";
+    std::cout << "║  [0] Skip calibration (use existing sensor settings)                  ║\n";
+    std::cout << "║  [1] Mode 1: Write Register 13 = 2 (integer)                          ║\n";
+    std::cout << "║  [2] Mode 2: Write Register 28 = 12.880 (float) + Register 13 = 3     ║\n";
+    std::cout << "║  [3] Mode 3: TEST - Write K=190 to Register 16 (test x10000 format)   ║\n";
+    std::cout << "╚═══════════════════════════════════════════════════════════════════════╝\n";
+    std::cout << "\n  Enter mode (0/1/2/3): ";
+
+    int choice;
+    std::cin >> choice;
+
+    if (choice >= 0 && choice <= 3) {
+        return static_cast<CalibrationMode>(choice);
+    }
+
+    std::cout << "  Invalid choice. Defaulting to Mode 0 (skip).\n";
+    return CAL_MODE_NONE;
+}
+
+// ===========================
 // CLEAR SCREEN (Cross-platform)
 // ===========================
 void clear_screen() {
@@ -143,6 +358,110 @@ std::string get_timestamp() {
     tstruct = *localtime(&now);
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tstruct);
     return buf;
+}
+
+// ===========================
+// DISPLAY SENSOR DIAGNOSTIC REGISTERS (REAL-TIME LOOP)
+// ===========================
+void display_sensor_diagnostics(modbus_t *ctx) {
+    int loop_count = 0;
+
+    std::cout << "\n  Starting real-time diagnostic monitor...\n";
+    std::cout << "  Press ENTER to stop monitoring and proceed to calibration.\n\n";
+    sleep(2);
+
+    // Set stdin to non-blocking mode
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    newt.c_cc[VMIN] = 0;
+    newt.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    while (true) {
+        loop_count++;
+        clear_screen();
+
+        std::cout << "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n";
+        std::cout << "┃         SENSOR DIAGNOSTIC REGISTERS (REAL-TIME)                   ┃\n";
+        std::cout << "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n";
+
+        std::cout << "  Time: " << get_timestamp() << "  |  Updates: " << loop_count << "\n\n";
+
+        uint16_t reg_value;
+        uint16_t reg_data[2];
+
+        // Read Register 1
+        if (modbus_read_registers(ctx, 1, 1, &reg_value) != -1) {
+            std::cout << "  Register  1 = " << std::setw(5) << reg_value
+                      << "  (0x" << std::hex << std::uppercase << std::setfill('0')
+                      << std::setw(4) << reg_value << std::dec << std::setfill(' ') << ")\n";
+        } else {
+            std::cout << "  Register  1 = [READ ERROR]\n";
+        }
+
+        // Read Register 2
+        if (modbus_read_registers(ctx, 2, 1, &reg_value) != -1) {
+            std::cout << "  Register  2 = " << std::setw(5) << reg_value
+                      << "  (0x" << std::hex << std::uppercase << std::setfill('0')
+                      << std::setw(4) << reg_value << std::dec << std::setfill(' ') << ")\n";
+        } else {
+            std::cout << "  Register  2 = [READ ERROR]\n";
+        }
+
+        // Read Register 16
+        if (modbus_read_registers(ctx, 16, 1, &reg_value) != -1) {
+            std::cout << "  Register 16 = " << std::setw(5) << reg_value
+                      << "  (0x" << std::hex << std::uppercase << std::setfill('0')
+                      << std::setw(4) << reg_value << std::dec << std::setfill(' ') << ")\n";
+        } else {
+            std::cout << "  Register 16 = [READ ERROR]\n";
+        }
+
+        std::cout << "\n  ─── Calibration Registers ───\n\n";
+
+        // Register 13 (calibration mode)
+        if (modbus_read_registers(ctx, 13, 1, &reg_value) != -1) {
+            std::cout << "  Register 13 = " << std::setw(5) << reg_value
+                      << "  (0x" << std::hex << std::uppercase << std::setfill('0')
+                      << std::setw(4) << reg_value << std::dec << std::setfill(' ')
+                      << ")  <- Calibration Mode\n";
+        } else {
+            std::cout << "  Register 13 = [READ ERROR]  <- Calibration Mode\n";
+        }
+
+        // Register 28 as float (calibration coefficient)
+        if (modbus_read_registers(ctx, 28, 2, reg_data) != -1) {
+            float coeff = modbus_get_float_abcd(reg_data);
+            std::cout << "  Register 28 = " << std::fixed << std::setprecision(3) << coeff
+                      << "  (Hex: " << to_hex_string(reg_data[0], reg_data[1])
+                      << ")  <- Calibration Coefficient\n";
+        } else {
+            std::cout << "  Register 28 = [READ ERROR]  <- Calibration Coefficient\n";
+        }
+
+        std::cout << "\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n";
+        std::cout << "  Use these values to verify sensor state.\n";
+        std::cout << "  >>> Press ENTER to proceed to calibration mode selection <<<\n";
+
+        std::cout.flush();
+
+        // Check if user pressed a key
+        char c;
+        if (read(STDIN_FILENO, &c, 1) > 0) {
+            if (c == '\n' || c == '\r' || c == ' ') {
+                break;  // Exit loop on Enter or Space
+            }
+        }
+
+        sleep(1);  // Update every 1 second
+    }
+
+    // Restore terminal settings
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
+    std::cout << "\n  Diagnostic monitoring stopped.\n\n";
 }
 
 // ===========================
@@ -287,7 +606,7 @@ void display_teacher_dashboard(double temp, double raw_ec, double sensor_ec, dou
 // ===========================
 // MAIN PROGRAM
 // ===========================
-int main() {
+int main(int argc, char* argv[]) {
     // Step 1: Auto-discover the sensor
     std::string port = find_sensor_port();
     
@@ -317,8 +636,19 @@ int main() {
     std::cout << "📊 Starting Smart Logger..." << std::endl;
     std::cout << "📝 Data will be logged to: ec_data_log.csv" << std::endl;
     std::cout << "   Press Ctrl+C to stop.\n" << std::endl;
-    
-    sleep(2);
+
+    // Step 2.5: Display sensor diagnostic registers
+    display_sensor_diagnostics(ctx);
+
+    // Step 2.6: Get calibration mode
+    CalibrationMode cal_mode = get_calibration_mode(argc, argv);
+
+    // Step 2.7: Execute calibration (after connection, before main loop)
+    if (!execute_calibration(ctx, cal_mode)) {
+        std::cerr << "⚠️  Calibration failed! Continuing with sensor defaults.\n";
+    }
+
+    sleep(1);
     
     // Step 3: Create/Open CSV file
     std::ofstream csv_file;

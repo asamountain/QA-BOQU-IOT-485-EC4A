@@ -61,56 +61,84 @@ echo      OK - usbipd found
 echo.
 echo [2/5] Scanning for USB-SERIAL CH340 device...
 
-REM Get the list and find the CH340 device
+REM ============================================================================
+REM SIMPLIFIED BUS ID DETECTION USING LENGTH CHECK
+REM ============================================================================
+REM Valid Bus ID: Short format (e.g., 6-1, 1-2, 10-3) - Usually < 10 chars
+REM Invalid UUID: Long format (e.g., c465442d-54e8-...) - Usually > 30 chars
+REM Strategy: Accept only IDs shorter than 10 characters
+
 set BUSID=
 set DEVICE_FOUND=0
 
 for /f "tokens=1,* delims= " %%a in ('usbipd list ^| findstr /i "CH340"') do (
-    set BUSID=%%a
-    set DEVICE_FOUND=1
-    echo      Found: %%a %%b
+    REM %%a contains the first token (potential Bus ID)
+    set TEMP_ID=%%a
+    
+    REM Simple length check using string manipulation
+    REM Extract 10 characters - if the result is empty, the string is < 10 chars
+    set ID_TEST=!TEMP_ID:~9,1!
+    
+    REM If position 9 (10th character) doesn't exist, the ID is < 10 chars (valid)
+    if "!ID_TEST!"=="" (
+        set BUSID=!TEMP_ID!
+        set DEVICE_FOUND=1
+        echo      Found Valid Bus ID: %%a %%b
+        echo      Selected BUSID: !TEMP_ID!
+        REM Jump immediately to device state check
+        goto :device_found
+    ) else (
+        echo      Skipped UUID: %%a %%b [Too long]
+    )
 )
 
-if !DEVICE_FOUND!==0 (
-    echo [ERROR] USB-SERIAL CH340 not found!
-    echo.
-    echo Please check:
-    echo   1. USB adapter is plugged in
-    echo   2. Device appears in Device Manager
-    echo.
-    usbipd list
-    echo.
-    pause
-    exit /b 1
-)
+REM Only reach here if NO valid device was found
+echo [ERROR] USB-SERIAL CH340 not found with valid Bus ID!
+echo.
+echo Please check:
+echo   1. USB adapter is plugged in
+echo   2. Device appears in Device Manager
+echo   3. Device has a standard Bus ID (not UUID)
+echo.
+echo Full device list:
+usbipd list
+echo.
+pause
+exit /b 1
 
-echo      BUSID: !BUSID!
+:device_found
+REM Valid device found - continue to next step
 
 echo.
-echo [3/5] Checking device state...
+echo [3/5] Preparing device for WSL...
 
-REM Check if device is already attached
+REM Check if device is already attached (if so, skip bind and attach steps)
 usbipd list | findstr /i "!BUSID!" | findstr /i "Attached" >nul 2>&1
 if %errorLevel% equ 0 (
-    echo      Device already attached to WSL
+    echo      Device already attached to WSL - Ready!
     goto :run_program
 )
 
-REM Check if device is shared (bound)
-usbipd list | findstr /i "!BUSID!" | findstr /i "Shared" >nul 2>&1
-if %errorLevel% neq 0 (
-    echo      Device not bound. Binding now...
-    usbipd bind --busid !BUSID! --force
-    if %errorLevel% neq 0 (
-        echo [WARNING] Bind returned error, but may still work. Continuing...
-    ) else (
-        echo      Successfully bound device
-    )
-    REM Small delay to let the bind take effect
-    timeout /t 1 /nobreak >nul
+REM ============================================================================
+REM FORCE BIND - Always bind regardless of current state
+REM ============================================================================
+REM This ensures the device is shared even if state detection fails
+REM The --force flag handles cases where it's already bound
+
+echo      Binding device to allow WSL access...
+usbipd bind --busid !BUSID! --force >nul 2>&1
+
+REM Check if bind succeeded (errorlevel 0 or 1 are both acceptable)
+REM Error code 1 often means "already bound" which is fine
+if %errorLevel% LEQ 1 (
+    echo      Device successfully bound/shared
 ) else (
-    echo      Device already bound/shared
+    echo [WARNING] Bind command returned error code %errorLevel%
+    echo           Will attempt to attach anyway...
 )
+
+REM Small delay to let the bind take effect
+timeout /t 1 /nobreak >nul
 
 echo.
 echo [4/5] Attaching device to WSL...
@@ -159,8 +187,26 @@ echo.
 echo ============================================================================
 echo.
 
-REM Simple, safe execution - just run the pre-compiled binary
-wsl bash -c "cd /mnt/c/Users/user/Coding/ATCAdjustedECValuation && sudo ./smart_logger"
+REM ============================================================================
+REM DYNAMIC PATH DETECTION
+REM ============================================================================
+REM %~dp0 = Directory of this batch file (e.g., C:\Users\iocrops admin\Coding\QA-BOQU-IOT-485-EC4A\)
+REM Remove trailing backslash: %~dp0 ends with \, so we strip it
+set "WIN_PROJECT_PATH=%~dp0"
+set "WIN_PROJECT_PATH=%WIN_PROJECT_PATH:~0,-1%"
+
+REM Convert Windows path to WSL path using wslpath
+REM Example: C:\Users\iocrops admin\Coding\QA -> /mnt/c/Users/iocrops admin/Coding/QA
+echo      Detecting project path...
+for /f "delims=" %%i in ('wsl wslpath -a "%WIN_PROJECT_PATH%"') do set "WSL_PROJECT_PATH=%%i"
+
+echo      Windows Path: %WIN_PROJECT_PATH%
+echo      WSL Path: %WSL_PROJECT_PATH%
+echo.
+
+REM Execute smart_logger using the dynamically detected path
+REM The path is quoted to handle spaces in usernames/folders
+wsl bash -c "cd \"%WSL_PROJECT_PATH%\" && sudo ./smart_logger"
 
 REM After program exits
 echo.
@@ -175,12 +221,12 @@ echo   1. Run visualization: python3 plot_data.py
 echo   2. Or restart test: run_test.bat
 echo.
 
-REM Ask if user wants to detach the device
-set /p DETACH="Detach USB device from WSL? (Y/N): "
-if /i "!DETACH!"=="Y" (
-    echo Detaching device...
-    usbipd detach --busid !BUSID!
-    echo Device detached. Available for Windows use.
+REM Ask if user wants to unbind the device
+set /p UNBIND="UNBIND USB device from WSL? (Y/N): "
+if /i "!UNBIND!"=="Y" (
+    echo UNBINDing all devices...
+    usbipd unbind --all
+    echo All devices unbinded. Available for Windows use.
 )
 
 echo.
