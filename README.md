@@ -7,9 +7,10 @@ This project provides a complete, automated environment for testing and validati
 **Key Feature:** Seamless integration between Windows (device handling) and WSL 2 (high-performance C++ execution) using a single automated script.
 
 ---
-![image.png](attachment:43ab755b-1706-4d5e-9a3b-095282bbcff3:image.png)
 
-![image.png](attachment:724f0490-4643-4310-8575-8500d7b65e9a:image.png)
+<img width="979" height="1032" alt="image" src="https://github.com/user-attachments/assets/ce76b969-f275-4f28-90b2-1950517c6931" />
+
+
 
 ## 🚀 Quick Start (The "One-Click" Way)
 
@@ -36,6 +37,9 @@ You do **not** need to manually compile code or attach USB devices. Everything i
 7.  ✅ Offer to detach the device when finished.
 
 ---
+
+<img width="1405" height="1025" alt="image" src="https://github.com/user-attachments/assets/cd534354-b643-4b58-95c8-3da281031898" />
+
 
 ## 📊 Visualization
 
@@ -95,4 +99,5 @@ double get_dynamic_k(double temp) {
 *   Check your wiring: A=A, B=B.
 *   Ensure the sensor is powered (12V/24V).
 *   Ensure the Slave ID is factory default (4).
+
 
