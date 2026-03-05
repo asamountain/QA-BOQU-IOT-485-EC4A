@@ -7,6 +7,9 @@ This project provides a complete, automated environment for testing and validati
 **Key Feature:** Seamless integration between Windows (device handling) and WSL 2 (high-performance C++ execution) using a single automated script.
 
 ---
+![image.png](attachment:43ab755b-1706-4d5e-9a3b-095282bbcff3:image.png)
+
+![image.png](attachment:724f0490-4643-4310-8575-8500d7b65e9a:image.png)
 
 ## 🚀 Quick Start (The "One-Click" Way)
 
@@ -92,3 +95,4 @@ double get_dynamic_k(double temp) {
 *   Check your wiring: A=A, B=B.
 *   Ensure the sensor is powered (12V/24V).
 *   Ensure the Slave ID is factory default (4).
+
